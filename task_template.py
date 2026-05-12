@@ -20,7 +20,7 @@ def make_model():
     model.fc = nn.Linear(model.fc.in_features, 100)
     return model
 
-checkpoint_path = "path/to/your/model_checkpoint.safetensors"  # Replace with your model checkpoint path 
+checkpoint_path = "/Users/jonaprinz/studies/Uni/TML/tml26_task2/target_model/weights.safetensors"  # Replace with your model checkpoint path 
 state_dict = load_file(checkpoint_path, device="cpu")
 
 model = make_model() 
@@ -33,7 +33,7 @@ transform = transforms.Compose([
                          (0.2675, 0.2565, 0.2761)),
 ])
 
-data_root = "path/to/cifar100"  # Replace with your CIFAR-100 dataset path, or where it should be downloaded
+data_root = "./dataset/cifar100"  # Replace with your CIFAR-100 dataset path, or where it should be downloaded
 dataset = datasets.CIFAR100(root=data_root, train=False, download=True, transform=transform)
 x, y = dataset[0]  # Example: get the first image and label
 
