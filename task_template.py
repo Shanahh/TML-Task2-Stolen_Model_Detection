@@ -1,22 +1,30 @@
 """
+Stolen Model Detection - low-FPR optimized version.
+
 Methods implemented:
-  1. Layerwise parameter cosine similarity
+  1. Layerwise parameter cosine/sign similarity
   2. BatchNorm statistic similarity
   3. Clean functional similarity on CIFAR-100 test/non-target/train-main subsets
   4. Target-train-subset memorization/alignment signal
-  5. Augmentation/transform sensitivity similarity
-  6. Linear CKA representation similarity on selected layers
-  7. Optional FGSM boundary/adversarial functional similarity
+  5. Same confident target mistake signal
+  6. Target high-leakage probes: low-margin + high-entropy samples
+  7. Synthetic/OOD soft-label similarity for knockoff/data-free extraction
+  8. Augmentation/transform sensitivity similarity
+  9. MixMatch-style augmentation averaging + sharpening signal
+ 10. Linear CKA representation similarity on selected layers
+ 11. Optional FGSM boundary/adversarial functional similarity
+ 12. Optional Jacobian/input-gradient fingerprinting
 
+Writes:
+  submission.csv
+  submission_features.csv
 """
 
 import argparse
 import json
-import math
-import os
 import random
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -24,7 +32,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, TensorDataset
 from torchvision import datasets, transforms
 from torchvision.models import resnet18
 
@@ -134,8 +142,13 @@ def sign_agreement(a: torch.Tensor, b: torch.Tensor) -> float:
 
 def rank01(values: np.ndarray, higher_is_more_stolen: bool = True) -> np.ndarray:
     values = np.asarray(values, dtype=np.float64)
-    values = np.nan_to_num(values, nan=np.nanmedian(values), posinf=np.nanmax(values), neginf=np.nanmin(values))
-    order = np.argsort(values)
+    finite = np.isfinite(values)
+    if not finite.any():
+        values = np.zeros_like(values)
+    else:
+        med = np.nanmedian(values[finite])
+        values = np.nan_to_num(values, nan=med, posinf=np.nanmax(values[finite]), neginf=np.nanmin(values[finite]))
+    order = np.argsort(values, kind="mergesort")
     ranks = np.empty_like(order, dtype=np.float64)
     ranks[order] = np.arange(len(values), dtype=np.float64)
     if len(values) > 1:
@@ -153,35 +166,30 @@ def robust_minmax(values: np.ndarray, lo_q: float = 1, hi_q: float = 99) -> np.n
     return np.clip((values - lo) / (hi - lo), 0, 1)
 
 
+def sharpen_probs(p: torch.Tensor, temperature: float = 0.5, eps: float = 1e-12) -> torch.Tensor:
+    q = torch.clamp(p, eps, 1.0) ** (1.0 / temperature)
+    return q / q.sum(dim=1, keepdim=True).clamp_min(eps)
+
+
 # -----------------------------
 # Weight / BN similarity
 # -----------------------------
 
 def weight_features(target_sd: Dict[str, torch.Tensor], suspect_sd: Dict[str, torch.Tensor]) -> Dict[str, float]:
-    cosines = []
-    signs = []
-    bn_cos = []
-    conv_cos = []
-    fc_cos = []
-    early_cos = []
-    late_cos = []
+    cosines, signs, bn_cos, conv_cos, fc_cos, early_cos, mid_cos, late_cos = [], [], [], [], [], [], [], []
 
     for name, tw in target_sd.items():
         if name not in suspect_sd:
             continue
         sw = suspect_sd[name]
-        if not torch.is_floating_point(tw):
-            continue
-        if tw.shape != sw.shape:
+        if not torch.is_floating_point(tw) or tw.shape != sw.shape:
             continue
 
         c = safe_cosine(tw, sw)
         cosines.append(c)
-
         if tw.numel() > 100:
             signs.append(sign_agreement(tw, sw))
-
-        if "bn" in name or "downsample.1" in name:
+        if "bn" in name or "downsample.1" in name or "running_mean" in name or "running_var" in name:
             bn_cos.append(c)
         if "conv" in name:
             conv_cos.append(c)
@@ -189,7 +197,9 @@ def weight_features(target_sd: Dict[str, torch.Tensor], suspect_sd: Dict[str, to
             fc_cos.append(c)
         if name.startswith("conv1") or name.startswith("bn1") or name.startswith("layer1"):
             early_cos.append(c)
-        if name.startswith("layer3") or name.startswith("layer4") or name.startswith("fc"):
+        if name.startswith("layer2") or name.startswith("layer3"):
+            mid_cos.append(c)
+        if name.startswith("layer4") or name.startswith("fc"):
             late_cos.append(c)
 
     def mean(xs):
@@ -201,6 +211,7 @@ def weight_features(target_sd: Dict[str, torch.Tensor], suspect_sd: Dict[str, to
         "w_cos_bn": mean(bn_cos),
         "w_cos_fc": mean(fc_cos),
         "w_cos_early": mean(early_cos),
+        "w_cos_mid": mean(mid_cos),
         "w_cos_late": mean(late_cos),
         "w_sign": mean(signs),
     }
@@ -217,8 +228,7 @@ def collect_logits(model: nn.Module, loader: DataLoader, device: torch.device, m
         if max_batches is not None and bi >= max_batches:
             break
         x = x.to(device, non_blocking=True)
-        logits = model(x).detach().cpu()
-        logits_all.append(logits)
+        logits_all.append(model(x).detach().cpu())
         y_all.append(y.cpu())
     return torch.cat(logits_all, dim=0), torch.cat(y_all, dim=0)
 
@@ -243,7 +253,7 @@ def logit_similarity_features(t_logits: torch.Tensor, s_logits: torch.Tensor, y:
     top1_agree = (t_pred == s_pred).float().mean().item()
     same_wrong = ((t_pred == s_pred) & (t_pred != y)).float().mean().item()
 
-    kl_ts = F.kl_div(s_logp, t_prob, reduction="batchmean").item()  # KL(target || suspect), lower is closer
+    kl_ts = F.kl_div(s_logp, t_prob, reduction="batchmean").item()
     kl_st = F.kl_div(t_logp, s_prob, reduction="batchmean").item()
     js = 0.5 * (kl_ts + kl_st)
 
@@ -255,9 +265,7 @@ def logit_similarity_features(t_logits: torch.Tensor, s_logits: torch.Tensor, y:
 
     t_rank = torch.argsort(t, dim=1, descending=True)[:, :5]
     s_rank = torch.argsort(s, dim=1, descending=True)[:, :5]
-    top5_overlap = []
-    for a, b in zip(t_rank, s_rank):
-        top5_overlap.append(len(set(a.tolist()).intersection(set(b.tolist()))) / 5.0)
+    top5_overlap = [len(set(a.tolist()).intersection(set(b.tolist()))) / 5.0 for a, b in zip(t_rank, s_rank)]
 
     return {
         f"{prefix}_logit_cos": float(logit_cos),
@@ -266,6 +274,46 @@ def logit_similarity_features(t_logits: torch.Tensor, s_logits: torch.Tensor, y:
         f"{prefix}_neg_js": float(-js),
         f"{prefix}_conf_corr": float(conf_corr),
         f"{prefix}_top5_overlap": float(np.mean(top5_overlap)),
+    }
+
+
+def masked_logit_features(t_logits: torch.Tensor, s_logits: torch.Tensor, y: torch.Tensor, mask: torch.Tensor, prefix: str) -> Dict[str, float]:
+    mask = mask.bool().cpu()
+    if mask.sum().item() < 8:
+        return {
+            f"{prefix}_logit_cos": 0.0,
+            f"{prefix}_top1_agree": 0.0,
+            f"{prefix}_same_wrong": 0.0,
+            f"{prefix}_neg_js": -100.0,
+            f"{prefix}_conf_corr": 0.0,
+            f"{prefix}_top5_overlap": 0.0,
+            f"{prefix}_n": float(mask.sum().item()),
+        }
+    out = logit_similarity_features(t_logits[mask], s_logits[mask], y[mask], prefix)
+    out[f"{prefix}_n"] = float(mask.sum().item())
+    return out
+
+
+def target_probe_masks(t_logits: torch.Tensor, y: torch.Tensor) -> Dict[str, torch.Tensor]:
+    prob = F.softmax(t_logits.float(), dim=1)
+    conf, pred = prob.max(dim=1)
+    top2 = torch.topk(prob, k=2, dim=1).values
+    margin = top2[:, 0] - top2[:, 1]
+    entropy = -(prob * torch.log(prob.clamp_min(1e-12))).sum(dim=1)
+
+    wrong = pred != y.long()
+    confident_wrong = wrong & (conf >= torch.quantile(conf, 0.70))
+    very_conf_wrong = wrong & (conf >= torch.quantile(conf, 0.85))
+    low_margin = margin <= torch.quantile(margin, 0.25)
+    high_entropy = entropy >= torch.quantile(entropy, 0.75)
+    high_leakage = low_margin | high_entropy
+
+    return {
+        "confwrong": confident_wrong.cpu(),
+        "vconfwrong": very_conf_wrong.cpu(),
+        "lowmargin": low_margin.cpu(),
+        "highentropy": high_entropy.cpu(),
+        "leakage": high_leakage.cpu(),
     }
 
 
@@ -326,11 +374,8 @@ def collect_features(model: nn.Module, loader: DataLoader, device: torch.device,
 
 
 def linear_cka(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-12) -> float:
-    # x: [n, dx], y: [n, dy]
-    x = x.float()
-    y = y.float()
-    x = x - x.mean(dim=0, keepdim=True)
-    y = y - y.mean(dim=0, keepdim=True)
+    x = x.float() - x.float().mean(dim=0, keepdim=True)
+    y = y.float() - y.float().mean(dim=0, keepdim=True)
     xty = x.T @ y
     hsic = (xty ** 2).sum()
     x_norm = ((x.T @ x) ** 2).sum().sqrt()
@@ -342,18 +387,27 @@ def linear_cka(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-12) -> float:
 
 
 def cka_features(target_feats: Dict[str, torch.Tensor], suspect_feats: Dict[str, torch.Tensor]) -> Dict[str, float]:
-    out = {}
-    vals = []
+    out, vals, early, mid, late = {}, [], [], [], []
     for name in target_feats.keys():
         val = linear_cka(target_feats[name], suspect_feats[name])
-        out[f"cka_{name.replace('.', '_')}"] = val
+        key = f"cka_{name.replace('.', '_')}"
+        out[key] = val
         vals.append(val)
+        if name in ["layer1", "layer2"]:
+            early.append(val)
+        if name in ["layer2", "layer3"]:
+            mid.append(val)
+        if name in ["layer4", "avgpool"]:
+            late.append(val)
     out["cka_mean"] = float(np.mean(vals)) if vals else 0.0
+    out["cka_early"] = float(np.mean(early)) if early else 0.0
+    out["cka_mid"] = float(np.mean(mid)) if mid else 0.0
+    out["cka_late"] = float(np.mean(late)) if late else 0.0
     return out
 
 
 # -----------------------------
-# Transform sensitivity
+# Transform / MixMatch / OOD
 # -----------------------------
 
 def denormalize(x: torch.Tensor) -> torch.Tensor:
@@ -369,7 +423,6 @@ def normalize(x: torch.Tensor) -> torch.Tensor:
 
 
 def transform_batch(x: torch.Tensor, mode: str) -> torch.Tensor:
-    # x is normalized. Transform in normalized/image space depending on operation.
     if mode == "hflip":
         return torch.flip(x, dims=[3])
     if mode == "shift_right":
@@ -382,14 +435,18 @@ def transform_batch(x: torch.Tensor, mode: str) -> torch.Tensor:
         u = denormalize(x).clamp(0, 1)
         u = (u + 0.08).clamp(0, 1)
         return normalize(u)
+    if mode == "cutout":
+        out = x.clone()
+        h0, w0 = 10, 10
+        out[:, :, h0:h0 + 10, w0:w0 + 10] = 0.0
+        return out
     raise ValueError(mode)
 
 
 @torch.no_grad()
 def transform_sensitivity_features(target: nn.Module, suspect: nn.Module, loader: DataLoader, device: torch.device, max_batches: int) -> Dict[str, float]:
-    modes = ["hflip", "shift_right", "shift_down", "noise", "brightness"]
-    sims = []
-    agrees = []
+    modes = ["hflip", "shift_right", "shift_down", "noise", "brightness", "cutout"]
+    sims, agrees = [], []
     for bi, (x, _) in enumerate(loader):
         if bi >= max_batches:
             break
@@ -412,15 +469,59 @@ def transform_sensitivity_features(target: nn.Module, suspect: nn.Module, loader
     }
 
 
+@torch.no_grad()
+def mixmatch_style_features(target: nn.Module, suspect: nn.Module, loader: DataLoader, device: torch.device, max_batches: int, temperature: float) -> Dict[str, float]:
+    cos_vals, neg_js_vals, top1_vals = [], [], []
+    modes = ["hflip", "shift_right", "noise"]
+    for bi, (x, y) in enumerate(loader):
+        if bi >= max_batches:
+            break
+        x = x.to(device, non_blocking=True)
+        t_probs, s_probs = [], []
+        for mode in ["identity"] + modes:
+            xx = x if mode == "identity" else transform_batch(x, mode)
+            t_probs.append(F.softmax(target(xx).float(), dim=1))
+            s_probs.append(F.softmax(suspect(xx).float(), dim=1))
+        tp = sharpen_probs(torch.stack(t_probs).mean(dim=0), temperature=temperature)
+        sp = sharpen_probs(torch.stack(s_probs).mean(dim=0), temperature=temperature)
+        cos_vals.append(F.cosine_similarity(tp, sp, dim=1).cpu())
+        js = 0.5 * (
+            F.kl_div(torch.log(sp.clamp_min(1e-12)), tp, reduction="none").sum(dim=1)
+            + F.kl_div(torch.log(tp.clamp_min(1e-12)), sp, reduction="none").sum(dim=1)
+        )
+        neg_js_vals.append((-js).cpu())
+        top1_vals.append((tp.argmax(dim=1) == sp.argmax(dim=1)).float().cpu())
+    if not cos_vals:
+        return {"mixmatch_cos": 0.0, "mixmatch_neg_js": 0.0, "mixmatch_top1": 0.0}
+    return {
+        "mixmatch_cos": float(torch.cat(cos_vals).mean().item()),
+        "mixmatch_neg_js": float(torch.cat(neg_js_vals).mean().item()),
+        "mixmatch_top1": float(torch.cat(top1_vals).mean().item()),
+    }
+
+
+def make_ood_loader(num: int, batch_size: int, workers: int, seed: int) -> DataLoader:
+    g = torch.Generator().manual_seed(seed)
+    # Three synthetic probe families in normalized space: uniform images, gaussian noise, and coarse color blocks.
+    n1 = num // 3
+    n2 = num // 3
+    n3 = num - n1 - n2
+    u = torch.rand(n1, 3, 32, 32, generator=g)
+    gnoise = torch.rand(n2, 3, 32, 32, generator=g).normal_(0.5, 0.25).clamp(0, 1)
+    blocks = torch.rand(n3, 3, 4, 4, generator=g)
+    blocks = F.interpolate(blocks, size=(32, 32), mode="nearest")
+    x = torch.cat([u, gnoise, blocks], dim=0)
+    x = normalize(x)
+    y = torch.zeros(len(x), dtype=torch.long)
+    return DataLoader(TensorDataset(x, y), batch_size=batch_size, shuffle=False, num_workers=workers, pin_memory=torch.cuda.is_available())
+
+
 # -----------------------------
-# Optional FGSM boundary similarity
+# Optional FGSM / Jacobian
 # -----------------------------
 
 def fgsm_boundary_features(target: nn.Module, suspect: nn.Module, loader: DataLoader, device: torch.device, max_batches: int, eps: float) -> Dict[str, float]:
-    target.eval()
-    suspect.eval()
     logit_cos, top1_agree, neg_js = [], [], []
-
     for bi, (x, _) in enumerate(loader):
         if bi >= max_batches:
             break
@@ -432,7 +533,6 @@ def fgsm_boundary_features(target: nn.Module, suspect: nn.Module, loader: DataLo
             loss = F.cross_entropy(logits, pseudo_y)
             grad = torch.autograd.grad(loss, x)[0]
             x_adv = (x + eps * grad.sign()).detach()
-
         with torch.no_grad():
             t = target(x_adv).float().cpu()
             s = suspect(x_adv).float().cpu()
@@ -441,7 +541,6 @@ def fgsm_boundary_features(target: nn.Module, suspect: nn.Module, loader: DataLo
             logit_cos.append(feats["fgsm_logit_cos"])
             top1_agree.append(feats["fgsm_top1_agree"])
             neg_js.append(feats["fgsm_neg_js"])
-
     return {
         "fgsm_logit_cos": float(np.mean(logit_cos)) if logit_cos else 0.0,
         "fgsm_top1_agree": float(np.mean(top1_agree)) if top1_agree else 0.0,
@@ -449,70 +548,100 @@ def fgsm_boundary_features(target: nn.Module, suspect: nn.Module, loader: DataLo
     }
 
 
+def jacobian_features(target: nn.Module, suspect: nn.Module, loader: DataLoader, device: torch.device, max_batches: int) -> Dict[str, float]:
+    cos_vals, sign_vals = [], []
+    for bi, (x, _) in enumerate(loader):
+        if bi >= max_batches:
+            break
+        x = x.to(device, non_blocking=True)
+        with torch.no_grad():
+            pseudo = target(x).argmax(dim=1)
+
+        xt = x.detach().clone().requires_grad_(True)
+        xs = x.detach().clone().requires_grad_(True)
+        with torch.enable_grad():
+            lt = F.cross_entropy(target(xt), pseudo)
+            ls = F.cross_entropy(suspect(xs), pseudo)
+            gt = torch.autograd.grad(lt, xt)[0].flatten(1)
+            gs = torch.autograd.grad(ls, xs)[0].flatten(1)
+        cos_vals.append(F.cosine_similarity(gt, gs, dim=1).detach().cpu())
+        sign_vals.append((torch.sign(gt) == torch.sign(gs)).float().mean(dim=1).detach().cpu())
+    if not cos_vals:
+        return {"jacobian_cos": 0.0, "jacobian_sign": 0.0}
+    return {
+        "jacobian_cos": float(torch.cat(cos_vals).mean().item()),
+        "jacobian_sign": float(torch.cat(sign_vals).mean().item()),
+    }
+
+
 # -----------------------------
-# Main scoring
+# Low-FPR specialist scoring
 # -----------------------------
+
+def mean_rank(df: pd.DataFrame, cols: List[str]) -> np.ndarray:
+    valid = [c for c in cols if c in df.columns]
+    if not valid:
+        return np.zeros(len(df), dtype=np.float64)
+    acc = np.zeros(len(df), dtype=np.float64)
+    for c in valid:
+        acc += rank01(df[c].values, higher_is_more_stolen=True)
+    return acc / len(valid)
+
 
 def build_final_scores(df: pd.DataFrame) -> np.ndarray:
-    # Rank-aggregate. Every selected feature is oriented so higher = more stolen-like.
-    groups = {
-        "weight": [
-            "w_cos_all", "w_cos_conv", "w_cos_bn", "w_cos_fc", "w_cos_early", "w_cos_late", "w_sign",
-        ],
-        "repr": [
-            "cka_mean", "cka_layer1", "cka_layer2", "cka_layer3", "cka_layer4", "cka_avgpool",
-        ],
-        "functional": [
-            "test_logit_cos", "test_top1_agree", "test_same_wrong", "test_neg_js", "test_conf_corr", "test_top5_overlap",
-            "main_logit_cos", "main_top1_agree", "main_same_wrong", "main_neg_js", "main_conf_corr", "main_top5_overlap",
-            "nonmain_logit_cos", "nonmain_top1_agree", "nonmain_same_wrong", "nonmain_neg_js", "nonmain_conf_corr", "nonmain_top5_overlap",
-        ],
-        "memorization": [
-            "mem_loss_gap_similarity", "mem_conf_gap_similarity", "mem_acc_gap_similarity",
-        ],
-        "transform": [
-            "transform_delta_cos", "transform_stability_agree",
-        ],
-        "fgsm": [
-            "fgsm_logit_cos", "fgsm_top1_agree", "fgsm_neg_js",
-        ],
-    }
-
-    group_weights = {
-        "weight": 0.25,
-        "repr": 0.25,
-        "functional": 0.22,
-        "memorization": 0.12,
-        "transform": 0.10,
-        "fgsm": 0.06,
-    }
-
+    """Max-of-specialists ranking tuned for TPR@5%FPR."""
     n = len(df)
-    final = np.zeros(n, dtype=np.float64)
-    used_weight = 0.0
 
-    for group, cols in groups.items():
-        valid_cols = [c for c in cols if c in df.columns]
-        if not valid_cols:
-            continue
-        group_score = np.zeros(n, dtype=np.float64)
-        for c in valid_cols:
-            group_score += rank01(df[c].values, higher_is_more_stolen=True)
-        group_score /= len(valid_cols)
-        final += group_weights[group] * group_score
-        used_weight += group_weights[group]
+    weight_rank = mean_rank(df, [
+        "w_cos_all", "w_cos_conv", "w_cos_bn", "w_cos_early", "w_cos_mid", "w_cos_late", "w_sign"
+    ])
+    bn_rank = mean_rank(df, ["w_cos_bn"])
+    early_mid_cka = mean_rank(df, ["cka_early", "cka_mid", "cka_layer1", "cka_layer2", "cka_layer3"])
+    late_cka = mean_rank(df, ["cka_late", "cka_layer4", "cka_avgpool"])
+    cka_rank = mean_rank(df, ["cka_mean", "cka_early", "cka_mid", "cka_late"])
 
-    if used_weight > 0:
-        final /= used_weight
+    # Clean agreement is deliberately weak. Same wrong and dark logits matter more.
+    clean_dark = mean_rank(df, [
+        "test_logit_cos", "test_neg_js", "test_top5_overlap", "main_neg_js", "nonmain_neg_js"
+    ])
+    mistake_rank = mean_rank(df, [
+        "test_same_wrong", "main_same_wrong", "nonmain_same_wrong",
+        "confwrong_top1_agree", "vconfwrong_top1_agree", "confwrong_logit_cos", "confwrong_neg_js"
+    ])
+    leakage_rank = mean_rank(df, [
+        "lowmargin_logit_cos", "lowmargin_neg_js", "lowmargin_top5_overlap",
+        "highentropy_logit_cos", "highentropy_neg_js", "leakage_logit_cos", "leakage_neg_js"
+    ])
+    ood_rank = mean_rank(df, ["ood_logit_cos", "ood_neg_js", "ood_top5_overlap", "ood_conf_corr"])
+    transform_rank = mean_rank(df, ["transform_delta_cos", "transform_stability_agree", "mixmatch_cos", "mixmatch_neg_js", "mixmatch_top1"])
+    mem_rank = mean_rank(df, [
+        "mem_loss_gap_similarity", "mem_conf_gap_similarity", "mem_acc_gap_similarity", "mem_agree_gap_similarity"
+    ])
+    fgsm_rank = mean_rank(df, ["fgsm_logit_cos", "fgsm_top1_agree", "fgsm_neg_js"])
+    jac_rank = mean_rank(df, ["jacobian_cos", "jacobian_sign"])
 
-    high_weight = rank01(df.get("w_cos_all", pd.Series(np.zeros(n))).values)
-    high_cka = rank01(df.get("cka_mean", pd.Series(np.zeros(n))).values)
-    high_func = rank01(df.get("test_neg_js", pd.Series(np.zeros(n))).values)
-    consensus = (high_weight * high_cka * high_func) ** (1.0 / 3.0)
-    final = 0.85 * final + 0.15 * consensus
+    direct_score = 0.58 * weight_rank + 0.30 * bn_rank + 0.12 * cka_rank
+    finetune_score = 0.34 * early_mid_cka + 0.24 * bn_rank + 0.18 * transform_rank + 0.24 * mem_rank
+    distilled_score = 0.28 * clean_dark + 0.24 * leakage_rank + 0.20 * ood_rank + 0.18 * mistake_rank + 0.10 * late_cka
+    boundary_score = 0.35 * leakage_rank + 0.25 * fgsm_rank + 0.20 * jac_rank + 0.20 * mistake_rank
+    dataset_score = 0.55 * mem_rank + 0.25 * early_mid_cka + 0.20 * transform_rank
 
-    return robust_minmax(final)
+    final = np.maximum.reduce([direct_score, finetune_score, distilled_score, boundary_score, dataset_score])
 
+    # High-confidence override for likely direct/fine-tuned descendants.
+    override = np.maximum.reduce([
+        0.70 * rank01(df.get("w_cos_all", pd.Series(np.zeros(n))).values) + 0.30 * rank01(df.get("w_cos_bn", pd.Series(np.zeros(n))).values),
+        0.55 * rank01(df.get("w_cos_early", pd.Series(np.zeros(n))).values) + 0.45 * rank01(df.get("cka_early", pd.Series(np.zeros(n))).values),
+    ])
+    final = np.maximum(final, 0.97 * override)
+
+    # Return percentile ranks, not raw values. This is better for TPR@low-FPR.
+    return rank01(final, higher_is_more_stolen=True)
+
+
+# -----------------------------
+# Main
+# -----------------------------
 
 def main():
     parser = argparse.ArgumentParser()
@@ -526,9 +655,14 @@ def main():
     parser.add_argument("--num-main", type=int, default=2048)
     parser.add_argument("--num-nonmain", type=int, default=2048)
     parser.add_argument("--cka-samples", type=int, default=512)
+    parser.add_argument("--ood-samples", type=int, default=768)
     parser.add_argument("--transform-batches", type=int, default=4)
+    parser.add_argument("--mixmatch-batches", type=int, default=4)
     parser.add_argument("--fgsm-batches", type=int, default=2)
+    parser.add_argument("--jacobian-batches", type=int, default=1)
+    parser.add_argument("--mixmatch-temperature", type=float, default=0.5)
     parser.add_argument("--no-fgsm", action="store_true", help="Disable FGSM similarity for speed.")
+    parser.add_argument("--no-jacobian", action="store_true", help="Disable Jacobian similarity for speed.")
     parser.add_argument("--seed", type=int, default=123)
     args = parser.parse_args()
 
@@ -565,6 +699,7 @@ def main():
     main_loader = make_subset_loader(train_ds, main_probe, args.batch_size, args.workers)
     nonmain_loader = make_subset_loader(train_ds, nonmain_probe, args.batch_size, args.workers)
     cka_loader = make_subset_loader(test_ds, cka_probe, args.batch_size, args.workers)
+    ood_loader = make_ood_loader(args.ood_samples, args.batch_size, args.workers, args.seed + 999)
 
     print("Loading target model...")
     target = load_resnet18_cifar100(target_path, device)
@@ -574,6 +709,9 @@ def main():
     target_test_logits, y_test = collect_logits(target, test_loader, device)
     target_main_logits, y_main = collect_logits(target, main_loader, device)
     target_nonmain_logits, y_nonmain = collect_logits(target, nonmain_loader, device)
+    target_ood_logits, y_ood = collect_logits(target, ood_loader, device)
+
+    target_masks = target_probe_masks(target_test_logits, y_test)
 
     t_main_loss, t_main_conf, t_main_acc = loss_confidence_stats(target_main_logits, y_main)
     t_nonmain_loss, t_nonmain_conf, t_nonmain_acc = loss_confidence_stats(target_nonmain_logits, y_nonmain)
@@ -581,10 +719,11 @@ def main():
     target_conf_gap = t_main_conf - t_nonmain_conf
     target_acc_gap = t_main_acc - t_nonmain_acc
 
+    target_agree_gap_ref = 0.0  # target agrees with itself equally; suspects get measured relative to target below.
+
     layer_names = ["layer1", "layer2", "layer3", "layer4", "avgpool"]
     target_feats = collect_features(target, cka_loader, device, layer_names)
 
-    rows = []
     suspect_paths = []
     for i in range(360):
         p = suspects_dir / f"suspect_{i:03d}.safetensors"
@@ -592,6 +731,7 @@ def main():
             raise FileNotFoundError(f"Missing suspect model: {p}")
         suspect_paths.append(p)
 
+    rows = []
     for model_id, suspect_path in enumerate(suspect_paths):
         print(f"[{model_id:03d}/359] scoring {suspect_path.name}")
         row = {"id": model_id}
@@ -606,10 +746,15 @@ def main():
         s_test_logits, _ = collect_logits(suspect, test_loader, device)
         s_main_logits, _ = collect_logits(suspect, main_loader, device)
         s_nonmain_logits, _ = collect_logits(suspect, nonmain_loader, device)
+        s_ood_logits, _ = collect_logits(suspect, ood_loader, device)
 
         row.update(logit_similarity_features(target_test_logits, s_test_logits, y_test, "test"))
         row.update(logit_similarity_features(target_main_logits, s_main_logits, y_main, "main"))
         row.update(logit_similarity_features(target_nonmain_logits, s_nonmain_logits, y_nonmain, "nonmain"))
+        row.update(logit_similarity_features(target_ood_logits, s_ood_logits, y_ood, "ood"))
+
+        for name, mask in target_masks.items():
+            row.update(masked_logit_features(target_test_logits, s_test_logits, y_test, mask, name))
 
         s_main_loss, s_main_conf, s_main_acc = loss_confidence_stats(s_main_logits, y_main)
         s_nonmain_loss, s_nonmain_conf, s_nonmain_acc = loss_confidence_stats(s_nonmain_logits, y_nonmain)
@@ -617,27 +762,36 @@ def main():
         suspect_conf_gap = s_main_conf - s_nonmain_conf
         suspect_acc_gap = s_main_acc - s_nonmain_acc
 
-        # Similarity to target's exact train-subset trace. Higher is closer.
         row["mem_loss_gap_similarity"] = -abs(suspect_loss_gap - target_loss_gap)
         row["mem_conf_gap_similarity"] = -abs(suspect_conf_gap - target_conf_gap)
         row["mem_acc_gap_similarity"] = -abs(suspect_acc_gap - target_acc_gap)
 
+        target_main_pred = target_main_logits.argmax(dim=1)
+        target_nonmain_pred = target_nonmain_logits.argmax(dim=1)
+        s_main_pred = s_main_logits.argmax(dim=1)
+        s_nonmain_pred = s_nonmain_logits.argmax(dim=1)
+        agree_main = (target_main_pred == s_main_pred).float().mean().item()
+        agree_nonmain = (target_nonmain_pred == s_nonmain_pred).float().mean().item()
+        # Higher means unusually aligned on the victim's exact train subset.
+        row["mem_agree_gap_similarity"] = agree_main - agree_nonmain - target_agree_gap_ref
+
         suspect_feats = collect_features(suspect, cka_loader, device, layer_names)
         row.update(cka_features(target_feats, suspect_feats))
 
-        row.update(transform_sensitivity_features(
-            target, suspect, test_loader, device, max_batches=args.transform_batches
-        ))
+        row.update(transform_sensitivity_features(target, suspect, test_loader, device, max_batches=args.transform_batches))
+        row.update(mixmatch_style_features(target, suspect, test_loader, device, max_batches=args.mixmatch_batches, temperature=args.mixmatch_temperature))
 
         if args.no_fgsm:
             row.update({"fgsm_logit_cos": 0.0, "fgsm_top1_agree": 0.0, "fgsm_neg_js": 0.0})
         else:
-            row.update(fgsm_boundary_features(
-                target, suspect, test_loader, device, max_batches=args.fgsm_batches, eps=0.03
-            ))
+            row.update(fgsm_boundary_features(target, suspect, test_loader, device, max_batches=args.fgsm_batches, eps=0.03))
+
+        if args.no_jacobian:
+            row.update({"jacobian_cos": 0.0, "jacobian_sign": 0.0})
+        else:
+            row.update(jacobian_features(target, suspect, test_loader, device, max_batches=args.jacobian_batches))
 
         rows.append(row)
-
         del suspect
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -645,19 +799,19 @@ def main():
             torch.mps.empty_cache()
 
     features_df = pd.DataFrame(rows).sort_values("id").reset_index(drop=True)
-    scores = build_final_scores(features_df)
-    features_df["score"] = scores
+    features_df["score"] = build_final_scores(features_df)
 
     out_path = Path(args.output)
     submission = features_df[["id", "score"]]
     submission.to_csv(out_path, index=False)
-
     debug_path = out_path.with_name(out_path.stem + "_features.csv")
     features_df.to_csv(debug_path, index=False)
 
     print(f"Wrote {out_path}")
     print(f"Wrote debug features to {debug_path}")
     print(submission.head())
+    print("Top 20 candidates:")
+    print(features_df.sort_values("score", ascending=False)[["id", "score", "w_cos_all", "w_cos_bn", "cka_mean", "test_same_wrong", "confwrong_top1_agree", "leakage_neg_js", "ood_neg_js"]].head(20).to_string(index=False))
 
 
 if __name__ == "__main__":
