@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Methods implemented:
   1. Layerwise parameter cosine similarity
