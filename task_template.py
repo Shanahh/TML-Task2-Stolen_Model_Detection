@@ -589,7 +589,12 @@ def mean_rank(df: pd.DataFrame, cols: List[str]) -> np.ndarray:
 
 
 def build_final_scores(df: pd.DataFrame) -> np.ndarray:
-    """Low-FPR specialist ranking tuned for TPR@5%FPR."""
+    """Low-FPR specialist ranking tuned for TPR@5%FPR.
+
+    This version promotes non-direct stolen families so direct-copy evidence does
+    not monopolize the top ranks. It also keeps raw-threshold overrides only for
+    genuinely obvious direct/fine-tuned descendants.
+    """
     n = len(df)
     zeros = pd.Series(np.zeros(n))
 
@@ -618,13 +623,11 @@ def build_final_scores(df: pd.DataFrame) -> np.ndarray:
         "mixmatch_cos", "mixmatch_neg_js", "mixmatch_top1"
     ])
     mem_rank = mean_rank(df, [
-        "mem_loss_gap_similarity", "mem_conf_gap_similarity",
-        "mem_acc_gap_similarity", "mem_agree_gap_similarity"
+        "mem_loss_gap_similarity", "mem_conf_gap_similarity", "mem_acc_gap_similarity", "mem_agree_gap_similarity"
     ])
     fgsm_rank = mean_rank(df, ["fgsm_logit_cos", "fgsm_top1_agree", "fgsm_neg_js"])
     jac_rank = mean_rank(df, ["jacobian_cos", "jacobian_sign"])
 
-    # More specialized, less averaged.
     direct_score = (
         0.50 * weight_rank
       + 0.35 * bn_rank
@@ -659,18 +662,43 @@ def build_final_scores(df: pd.DataFrame) -> np.ndarray:
       + 0.15 * transform_rank
     )
 
-    # Conservative consensus terms. Helps low-FPR ranking.
-    copy_consensus = np.sqrt(np.maximum(direct_score, 1e-9) * np.maximum(finetune_score, 1e-9))
-    behavior_consensus = np.sqrt(np.maximum(distilled_score, 1e-9) * np.maximum(boundary_score, 1e-9))
-    dataset_consensus = np.sqrt(np.maximum(dataset_score, 1e-9) * np.maximum(early_mid_cka, 1e-9))
+    copy_consensus = np.sqrt(
+        np.maximum(direct_score, 1e-9)
+        * np.maximum(finetune_score, 1e-9)
+    )
+
+    behavior_consensus = np.sqrt(
+        np.maximum(distilled_score, 1e-9)
+        * np.maximum(boundary_score, 1e-9)
+    )
+
+    dataset_consensus = np.sqrt(
+        np.maximum(dataset_score, 1e-9)
+        * np.maximum(early_mid_cka, 1e-9)
+    )
+
+    non_direct_family = np.maximum.reduce([
+        distilled_score,
+        boundary_score,
+        dataset_score,
+    ])
+
+    # Non-direct support requires representation + behavioral evidence.
+    non_direct_supported = non_direct_family * np.sqrt(
+        np.maximum(cka_rank, 1e-9)
+        * np.maximum((mistake_rank + leakage_rank) / 2.0, 1e-9)
+    )
 
     final = np.maximum.reduce([
         direct_score,
         finetune_score,
-        0.90 * distilled_score + 0.10 * behavior_consensus,
-        0.90 * boundary_score + 0.10 * behavior_consensus,
-        0.90 * dataset_score + 0.10 * dataset_consensus,
+        1.08 * distilled_score,
+        1.08 * boundary_score,
+        1.05 * dataset_score,
+        1.12 * non_direct_supported,
         0.70 * copy_consensus + 0.30 * direct_score,
+        0.90 * behavior_consensus + 0.10 * non_direct_family,
+        0.90 * dataset_consensus + 0.10 * dataset_score,
     ])
 
     # Hard override only for genuinely obvious descendants.
@@ -693,11 +721,10 @@ def build_final_scores(df: pd.DataFrame) -> np.ndarray:
         (transform_raw > 0.65)
     )
 
-    final[obvious_direct] = np.maximum(final[obvious_direct], 0.995)
-    final[obvious_finetune] = np.maximum(final[obvious_finetune], 0.970)
+    final[obvious_direct] = np.maximum(final[obvious_direct], 0.990)
+    final[obvious_finetune] = np.maximum(final[obvious_finetune], 0.975)
 
-    # Penalize clean-agreement-only models:
-    # likely independent same-distribution models.
+    # Penalize clean-agreement-only models: likely independent same-distribution models.
     clean_top1 = rank01(df.get("test_top1_agree", zeros).values)
     clean_top5 = rank01(df.get("test_top5_overlap", zeros).values)
     clean_signal = 0.5 * clean_top1 + 0.5 * clean_top5
@@ -735,13 +762,14 @@ def build_final_scores(df: pd.DataFrame) -> np.ndarray:
 
     return rank01(final, higher_is_more_stolen=True)
 
-def _safe_col(df, col):
+
+def _safe_col(df: pd.DataFrame, col: str) -> np.ndarray:
     if col in df.columns:
         return df[col].values
     return np.zeros(len(df), dtype=np.float64)
 
 
-def _rank_col(df, col):
+def _rank_col(df: pd.DataFrame, col: str) -> np.ndarray:
     return rank01(_safe_col(df, col), higher_is_more_stolen=True)
 
 
@@ -758,16 +786,16 @@ def mean_rank_debug(df: pd.DataFrame, cols: List[str]) -> np.ndarray:
 def add_debug_score_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Recompute interpretable score components and attach them to df."""
     out = df.copy()
-    n = len(out)
 
     out["dbg_weight"] = mean_rank_debug(out, [
         "w_cos_all", "w_cos_conv", "w_cos_bn", "w_cos_early", "w_cos_mid", "w_cos_late", "w_sign"
     ])
     out["dbg_bn"] = mean_rank_debug(out, ["w_cos_bn"])
-    out["dbg_cka"] = mean_rank_debug(out, ["cka_mean", "cka_early", "cka_mid", "cka_late", "cka_layer1", "cka_layer2", "cka_layer3", "cka_layer4", "cka_avgpool"])
+    out["dbg_cka"] = mean_rank_debug(out, [
+        "cka_mean", "cka_early", "cka_mid", "cka_late", "cka_layer1", "cka_layer2", "cka_layer3", "cka_layer4", "cka_avgpool"
+    ])
     out["dbg_early_mid_cka"] = mean_rank_debug(out, ["cka_early", "cka_mid", "cka_layer1", "cka_layer2", "cka_layer3"])
     out["dbg_late_cka"] = mean_rank_debug(out, ["cka_late", "cka_layer4", "cka_avgpool"])
-
     out["dbg_clean_dark"] = mean_rank_debug(out, [
         "test_logit_cos", "test_neg_js", "test_top5_overlap", "main_neg_js", "nonmain_neg_js"
     ])
@@ -789,76 +817,34 @@ def add_debug_score_columns(df: pd.DataFrame) -> pd.DataFrame:
     out["dbg_fgsm"] = mean_rank_debug(out, ["fgsm_logit_cos", "fgsm_top1_agree", "fgsm_neg_js"])
     out["dbg_jac"] = mean_rank_debug(out, ["jacobian_cos", "jacobian_sign"])
 
-    out["dbg_direct_score"] = (
-        0.50 * out["dbg_weight"]
-      + 0.35 * out["dbg_bn"]
-      + 0.15 * out["dbg_cka"]
-    )
-
-    out["dbg_finetune_score"] = (
-        0.35 * out["dbg_early_mid_cka"]
-      + 0.25 * out["dbg_bn"]
-      + 0.25 * out["dbg_mem"]
-      + 0.15 * out["dbg_transform"]
-    )
-
-    out["dbg_distilled_score"] = (
-        0.28 * out["dbg_leakage"]
-      + 0.22 * out["dbg_ood"]
-      + 0.22 * out["dbg_mistake"]
-      + 0.18 * out["dbg_clean_dark"]
-      + 0.10 * out["dbg_late_cka"]
-    )
-
-    out["dbg_boundary_score"] = (
-        0.35 * out["dbg_leakage"]
-      + 0.25 * out["dbg_fgsm"]
-      + 0.20 * out["dbg_jac"]
-      + 0.20 * out["dbg_mistake"]
-    )
-
-    out["dbg_dataset_score"] = (
-        0.60 * out["dbg_mem"]
-      + 0.25 * out["dbg_early_mid_cka"]
-      + 0.15 * out["dbg_transform"]
-    )
+    out["dbg_direct_score"] = 0.50 * out["dbg_weight"] + 0.35 * out["dbg_bn"] + 0.15 * out["dbg_cka"]
+    out["dbg_finetune_score"] = 0.35 * out["dbg_early_mid_cka"] + 0.25 * out["dbg_bn"] + 0.25 * out["dbg_mem"] + 0.15 * out["dbg_transform"]
+    out["dbg_distilled_score"] = 0.28 * out["dbg_leakage"] + 0.22 * out["dbg_ood"] + 0.22 * out["dbg_mistake"] + 0.18 * out["dbg_clean_dark"] + 0.10 * out["dbg_late_cka"]
+    out["dbg_boundary_score"] = 0.35 * out["dbg_leakage"] + 0.25 * out["dbg_fgsm"] + 0.20 * out["dbg_jac"] + 0.20 * out["dbg_mistake"]
+    out["dbg_dataset_score"] = 0.60 * out["dbg_mem"] + 0.25 * out["dbg_early_mid_cka"] + 0.15 * out["dbg_transform"]
 
     specialist_cols = [
-        "dbg_direct_score",
-        "dbg_finetune_score",
-        "dbg_distilled_score",
-        "dbg_boundary_score",
-        "dbg_dataset_score",
+        "dbg_direct_score", "dbg_finetune_score", "dbg_distilled_score", "dbg_boundary_score", "dbg_dataset_score",
     ]
-
     out["dbg_best_specialist_value"] = out[specialist_cols].max(axis=1)
     out["dbg_best_specialist"] = out[specialist_cols].idxmax(axis=1).str.replace("dbg_", "").str.replace("_score", "")
 
-    # How many independent score families support this model?
     support_cols = [
-        "dbg_weight", "dbg_cka", "dbg_clean_dark", "dbg_mistake",
-        "dbg_leakage", "dbg_ood", "dbg_transform", "dbg_mem", "dbg_fgsm", "dbg_jac"
+        "dbg_weight", "dbg_cka", "dbg_clean_dark", "dbg_mistake", "dbg_leakage",
+        "dbg_ood", "dbg_transform", "dbg_mem", "dbg_fgsm", "dbg_jac",
     ]
     out["dbg_support_count_80"] = (out[support_cols] >= 0.80).sum(axis=1)
     out["dbg_support_count_90"] = (out[support_cols] >= 0.90).sum(axis=1)
 
     out["dbg_clean_only_risk"] = (
-        0.5 * _rank_col(out, "test_top1_agree")
-      + 0.5 * _rank_col(out, "test_top5_overlap")
+        0.5 * _rank_col(out, "test_top1_agree") + 0.5 * _rank_col(out, "test_top5_overlap")
     ) * (1.0 - np.maximum.reduce([
-        out["dbg_weight"].values,
-        out["dbg_cka"].values,
-        out["dbg_mistake"].values,
-        out["dbg_mem"].values,
+        out["dbg_weight"].values, out["dbg_cka"].values, out["dbg_mistake"].values, out["dbg_mem"].values,
     ]))
 
     out["dbg_ood_only_risk"] = out["dbg_ood"] * (1.0 - np.maximum.reduce([
-        out["dbg_leakage"].values,
-        out["dbg_mistake"].values,
-        out["dbg_late_cka"].values,
-        out["dbg_cka"].values,
+        out["dbg_leakage"].values, out["dbg_mistake"].values, out["dbg_late_cka"].values, out["dbg_cka"].values,
     ]))
-
     return out
 
 
@@ -867,31 +853,12 @@ def debug_diagnostics(df: pd.DataFrame, path: Path, top_k: int = 40):
     dbg = dbg.sort_values("score", ascending=False).reset_index(drop=True)
 
     component_cols = [
-        "score",
-        "dbg_best_specialist",
-        "dbg_best_specialist_value",
-        "dbg_direct_score",
-        "dbg_finetune_score",
-        "dbg_distilled_score",
-        "dbg_boundary_score",
-        "dbg_dataset_score",
-        "dbg_weight",
-        "dbg_bn",
-        "dbg_cka",
-        "dbg_clean_dark",
-        "dbg_mistake",
-        "dbg_leakage",
-        "dbg_ood",
-        "dbg_transform",
-        "dbg_mem",
-        "dbg_fgsm",
-        "dbg_jac",
-        "dbg_support_count_80",
-        "dbg_support_count_90",
-        "dbg_clean_only_risk",
-        "dbg_ood_only_risk",
+        "score", "dbg_best_specialist", "dbg_best_specialist_value",
+        "dbg_direct_score", "dbg_finetune_score", "dbg_distilled_score", "dbg_boundary_score", "dbg_dataset_score",
+        "dbg_weight", "dbg_bn", "dbg_cka", "dbg_clean_dark", "dbg_mistake", "dbg_leakage", "dbg_ood",
+        "dbg_transform", "dbg_mem", "dbg_fgsm", "dbg_jac", "dbg_support_count_80", "dbg_support_count_90",
+        "dbg_clean_only_risk", "dbg_ood_only_risk",
     ]
-
     available_component_cols = ["id"] + [c for c in component_cols if c in dbg.columns]
 
     with open(path, "w") as f:
@@ -910,6 +877,30 @@ def debug_diagnostics(df: pd.DataFrame, path: Path, top_k: int = 40):
             f.write(f"{c:28s} top20={top[c].mean():.4f} rest={rest[c].mean():.4f} diff={top[c].mean() - rest[c].mean():.4f}\n")
         f.write("\n")
 
+        f.write("=== COMPONENT MEANS BY RANK BAND ===\n")
+        bands = {
+            "top20": dbg.iloc[:20],
+            "rank21_40": dbg.iloc[20:40],
+            "rank41_80": dbg.iloc[40:80],
+            "rank81_120": dbg.iloc[80:120],
+            "rest": dbg.iloc[120:],
+        }
+        band_cols = [
+            "dbg_direct_score", "dbg_finetune_score", "dbg_distilled_score", "dbg_boundary_score", "dbg_dataset_score",
+            "dbg_weight", "dbg_bn", "dbg_cka", "dbg_clean_dark", "dbg_mistake", "dbg_leakage", "dbg_ood",
+            "dbg_transform", "dbg_mem", "dbg_fgsm", "dbg_jac", "dbg_support_count_80", "dbg_support_count_90",
+            "dbg_clean_only_risk", "dbg_ood_only_risk",
+        ]
+        for name, part in bands.items():
+            f.write(f"\n[{name}]\n")
+            if len(part) == 0:
+                f.write("empty\n")
+                continue
+            for c in band_cols:
+                if c in part.columns:
+                    f.write(f"{c:28s} mean={part[c].mean():.4f}\n")
+        f.write("\n")
+
         f.write("=== POSSIBLE FALSE POSITIVES: HIGH SCORE BUT CLEAN-ONLY RISK ===\n")
         risky = dbg.sort_values(["dbg_clean_only_risk", "score"], ascending=[False, False])
         f.write(risky[available_component_cols].head(25).to_string(index=False))
@@ -922,8 +913,9 @@ def debug_diagnostics(df: pd.DataFrame, path: Path, top_k: int = 40):
 
         f.write("=== TOP RAW FEATURE CORRELATIONS WITH FINAL SCORE ===\n")
         numeric = dbg.select_dtypes(include=[np.number])
-        corrs = numeric.corr(numeric_only=True)["score"].sort_values(ascending=False)
-        f.write(corrs.head(40).to_string())
+        if "score" in numeric.columns:
+            corrs = numeric.corr(numeric_only=True)["score"].sort_values(ascending=False)
+            f.write(corrs.head(40).to_string())
         f.write("\n\n")
 
         f.write("=== FEATURES MOST DIFFERENT IN TOP 20 VS REST ===\n")
@@ -932,13 +924,11 @@ def debug_diagnostics(df: pd.DataFrame, path: Path, top_k: int = 40):
             if c in ["id", "score"]:
                 continue
             diffs[c] = top[c].mean() - rest[c].mean()
-        diffs = pd.Series(diffs).sort_values(ascending=False)
-        f.write(diffs.head(50).to_string())
+        f.write(pd.Series(diffs).sort_values(ascending=False).head(50).to_string())
         f.write("\n")
 
     csv_path = path.with_suffix(".csv")
     dbg.to_csv(csv_path, index=False)
-
     print(f"Wrote diagnostics to {path}")
     print(f"Wrote ranked diagnostics CSV to {csv_path}")
     print("\nTop 20 model diagnostics:")
@@ -954,6 +944,7 @@ def main():
     parser.add_argument("--root", type=str, default=".", help="Project root containing target_model/ and suspect_models/.")
     parser.add_argument("--data-root", type=str, default="./dataset/cifar100")
     parser.add_argument("--output", type=str, default="submission.csv")
+    parser.add_argument("--features-csv", type=str, default=None, help="Optional path to an existing submission_features.csv. If set, skip feature extraction and only rescore.")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--workers", type=int, default=2)
@@ -971,6 +962,42 @@ def main():
     parser.add_argument("--no-jacobian", action="store_true", help="Disable Jacobian similarity for speed.")
     parser.add_argument("--seed", type=int, default=123)
     args = parser.parse_args()
+
+    # Fast path: reuse existing extracted features and only rebuild scores.
+    if args.features_csv is not None:
+        features_path = Path(args.features_csv)
+        if not features_path.exists():
+            raise FileNotFoundError(features_path)
+
+        print(f"Loading existing features from {features_path}")
+        features_df = pd.read_csv(features_path).sort_values("id").reset_index(drop=True)
+
+        if "id" not in features_df.columns:
+            raise ValueError(f"{features_path} must contain an 'id' column")
+        if len(features_df) != 360:
+            raise ValueError(f"{features_path} must contain 360 rows, got {len(features_df)}")
+
+        features_df["score"] = build_final_scores(features_df)
+
+        out_path = Path(args.output)
+        submission = features_df[["id", "score"]].copy()
+        submission["id"] = submission["id"].astype(int)
+        submission.to_csv(out_path, index=False)
+
+        rescored_features_path = out_path.with_name(out_path.stem + "_features_rescored.csv")
+        features_df.to_csv(rescored_features_path, index=False)
+        debug_diagnostics(features_df, out_path.with_name(out_path.stem + "_diagnostics.txt"))
+
+        print(f"Wrote {out_path}")
+        print(f"Wrote rescored features to {rescored_features_path}")
+        print("Top 20 candidates:")
+        printable_cols = [
+            "id", "score", "w_cos_all", "w_cos_bn", "cka_mean",
+            "test_same_wrong", "confwrong_top1_agree", "leakage_neg_js", "ood_neg_js",
+        ]
+        printable_cols = [c for c in printable_cols if c in features_df.columns]
+        print(features_df.sort_values("score", ascending=False)[printable_cols].head(20).to_string(index=False))
+        return
 
     seed_everything(args.seed)
     device = get_device(args.device)
