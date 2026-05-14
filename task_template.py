@@ -735,6 +735,215 @@ def build_final_scores(df: pd.DataFrame) -> np.ndarray:
 
     return rank01(final, higher_is_more_stolen=True)
 
+def _safe_col(df, col):
+    if col in df.columns:
+        return df[col].values
+    return np.zeros(len(df), dtype=np.float64)
+
+
+def _rank_col(df, col):
+    return rank01(_safe_col(df, col), higher_is_more_stolen=True)
+
+
+def mean_rank_debug(df: pd.DataFrame, cols: List[str]) -> np.ndarray:
+    valid = [c for c in cols if c in df.columns]
+    if not valid:
+        return np.zeros(len(df), dtype=np.float64)
+    out = np.zeros(len(df), dtype=np.float64)
+    for c in valid:
+        out += _rank_col(df, c)
+    return out / len(valid)
+
+
+def add_debug_score_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Recompute interpretable score components and attach them to df."""
+    out = df.copy()
+    n = len(out)
+
+    out["dbg_weight"] = mean_rank_debug(out, [
+        "w_cos_all", "w_cos_conv", "w_cos_bn", "w_cos_early", "w_cos_mid", "w_cos_late", "w_sign"
+    ])
+    out["dbg_bn"] = mean_rank_debug(out, ["w_cos_bn"])
+    out["dbg_cka"] = mean_rank_debug(out, ["cka_mean", "cka_early", "cka_mid", "cka_late", "cka_layer1", "cka_layer2", "cka_layer3", "cka_layer4", "cka_avgpool"])
+    out["dbg_early_mid_cka"] = mean_rank_debug(out, ["cka_early", "cka_mid", "cka_layer1", "cka_layer2", "cka_layer3"])
+    out["dbg_late_cka"] = mean_rank_debug(out, ["cka_late", "cka_layer4", "cka_avgpool"])
+
+    out["dbg_clean_dark"] = mean_rank_debug(out, [
+        "test_logit_cos", "test_neg_js", "test_top5_overlap", "main_neg_js", "nonmain_neg_js"
+    ])
+    out["dbg_mistake"] = mean_rank_debug(out, [
+        "test_same_wrong", "main_same_wrong", "nonmain_same_wrong",
+        "confwrong_top1_agree", "vconfwrong_top1_agree", "confwrong_logit_cos", "confwrong_neg_js"
+    ])
+    out["dbg_leakage"] = mean_rank_debug(out, [
+        "lowmargin_logit_cos", "lowmargin_neg_js", "lowmargin_top5_overlap",
+        "highentropy_logit_cos", "highentropy_neg_js", "leakage_logit_cos", "leakage_neg_js"
+    ])
+    out["dbg_ood"] = mean_rank_debug(out, ["ood_logit_cos", "ood_neg_js", "ood_top5_overlap", "ood_conf_corr"])
+    out["dbg_transform"] = mean_rank_debug(out, [
+        "transform_delta_cos", "transform_stability_agree", "mixmatch_cos", "mixmatch_neg_js", "mixmatch_top1"
+    ])
+    out["dbg_mem"] = mean_rank_debug(out, [
+        "mem_loss_gap_similarity", "mem_conf_gap_similarity", "mem_acc_gap_similarity", "mem_agree_gap_similarity"
+    ])
+    out["dbg_fgsm"] = mean_rank_debug(out, ["fgsm_logit_cos", "fgsm_top1_agree", "fgsm_neg_js"])
+    out["dbg_jac"] = mean_rank_debug(out, ["jacobian_cos", "jacobian_sign"])
+
+    out["dbg_direct_score"] = (
+        0.50 * out["dbg_weight"]
+      + 0.35 * out["dbg_bn"]
+      + 0.15 * out["dbg_cka"]
+    )
+
+    out["dbg_finetune_score"] = (
+        0.35 * out["dbg_early_mid_cka"]
+      + 0.25 * out["dbg_bn"]
+      + 0.25 * out["dbg_mem"]
+      + 0.15 * out["dbg_transform"]
+    )
+
+    out["dbg_distilled_score"] = (
+        0.28 * out["dbg_leakage"]
+      + 0.22 * out["dbg_ood"]
+      + 0.22 * out["dbg_mistake"]
+      + 0.18 * out["dbg_clean_dark"]
+      + 0.10 * out["dbg_late_cka"]
+    )
+
+    out["dbg_boundary_score"] = (
+        0.35 * out["dbg_leakage"]
+      + 0.25 * out["dbg_fgsm"]
+      + 0.20 * out["dbg_jac"]
+      + 0.20 * out["dbg_mistake"]
+    )
+
+    out["dbg_dataset_score"] = (
+        0.60 * out["dbg_mem"]
+      + 0.25 * out["dbg_early_mid_cka"]
+      + 0.15 * out["dbg_transform"]
+    )
+
+    specialist_cols = [
+        "dbg_direct_score",
+        "dbg_finetune_score",
+        "dbg_distilled_score",
+        "dbg_boundary_score",
+        "dbg_dataset_score",
+    ]
+
+    out["dbg_best_specialist_value"] = out[specialist_cols].max(axis=1)
+    out["dbg_best_specialist"] = out[specialist_cols].idxmax(axis=1).str.replace("dbg_", "").str.replace("_score", "")
+
+    # How many independent score families support this model?
+    support_cols = [
+        "dbg_weight", "dbg_cka", "dbg_clean_dark", "dbg_mistake",
+        "dbg_leakage", "dbg_ood", "dbg_transform", "dbg_mem", "dbg_fgsm", "dbg_jac"
+    ]
+    out["dbg_support_count_80"] = (out[support_cols] >= 0.80).sum(axis=1)
+    out["dbg_support_count_90"] = (out[support_cols] >= 0.90).sum(axis=1)
+
+    out["dbg_clean_only_risk"] = (
+        0.5 * _rank_col(out, "test_top1_agree")
+      + 0.5 * _rank_col(out, "test_top5_overlap")
+    ) * (1.0 - np.maximum.reduce([
+        out["dbg_weight"].values,
+        out["dbg_cka"].values,
+        out["dbg_mistake"].values,
+        out["dbg_mem"].values,
+    ]))
+
+    out["dbg_ood_only_risk"] = out["dbg_ood"] * (1.0 - np.maximum.reduce([
+        out["dbg_leakage"].values,
+        out["dbg_mistake"].values,
+        out["dbg_late_cka"].values,
+        out["dbg_cka"].values,
+    ]))
+
+    return out
+
+
+def debug_diagnostics(df: pd.DataFrame, path: Path, top_k: int = 40):
+    dbg = add_debug_score_columns(df)
+    dbg = dbg.sort_values("score", ascending=False).reset_index(drop=True)
+
+    component_cols = [
+        "score",
+        "dbg_best_specialist",
+        "dbg_best_specialist_value",
+        "dbg_direct_score",
+        "dbg_finetune_score",
+        "dbg_distilled_score",
+        "dbg_boundary_score",
+        "dbg_dataset_score",
+        "dbg_weight",
+        "dbg_bn",
+        "dbg_cka",
+        "dbg_clean_dark",
+        "dbg_mistake",
+        "dbg_leakage",
+        "dbg_ood",
+        "dbg_transform",
+        "dbg_mem",
+        "dbg_fgsm",
+        "dbg_jac",
+        "dbg_support_count_80",
+        "dbg_support_count_90",
+        "dbg_clean_only_risk",
+        "dbg_ood_only_risk",
+    ]
+
+    available_component_cols = ["id"] + [c for c in component_cols if c in dbg.columns]
+
+    with open(path, "w") as f:
+        f.write("=== TOP MODELS BY FINAL SCORE ===\n")
+        f.write(dbg[available_component_cols].head(top_k).to_string(index=False))
+        f.write("\n\n")
+
+        f.write("=== BEST SPECIALIST COUNTS IN TOP MODELS ===\n")
+        f.write(dbg.head(top_k)["dbg_best_specialist"].value_counts().to_string())
+        f.write("\n\n")
+
+        f.write("=== MEAN COMPONENT VALUES: TOP 20 VS REST ===\n")
+        top = dbg.head(20)
+        rest = dbg.iloc[20:]
+        for c in [col for col in component_cols if col in dbg.columns and col != "dbg_best_specialist"]:
+            f.write(f"{c:28s} top20={top[c].mean():.4f} rest={rest[c].mean():.4f} diff={top[c].mean() - rest[c].mean():.4f}\n")
+        f.write("\n")
+
+        f.write("=== POSSIBLE FALSE POSITIVES: HIGH SCORE BUT CLEAN-ONLY RISK ===\n")
+        risky = dbg.sort_values(["dbg_clean_only_risk", "score"], ascending=[False, False])
+        f.write(risky[available_component_cols].head(25).to_string(index=False))
+        f.write("\n\n")
+
+        f.write("=== OOD-ONLY RISK ===\n")
+        ood_risky = dbg.sort_values(["dbg_ood_only_risk", "score"], ascending=[False, False])
+        f.write(ood_risky[available_component_cols].head(25).to_string(index=False))
+        f.write("\n\n")
+
+        f.write("=== TOP RAW FEATURE CORRELATIONS WITH FINAL SCORE ===\n")
+        numeric = dbg.select_dtypes(include=[np.number])
+        corrs = numeric.corr(numeric_only=True)["score"].sort_values(ascending=False)
+        f.write(corrs.head(40).to_string())
+        f.write("\n\n")
+
+        f.write("=== FEATURES MOST DIFFERENT IN TOP 20 VS REST ===\n")
+        diffs = {}
+        for c in numeric.columns:
+            if c in ["id", "score"]:
+                continue
+            diffs[c] = top[c].mean() - rest[c].mean()
+        diffs = pd.Series(diffs).sort_values(ascending=False)
+        f.write(diffs.head(50).to_string())
+        f.write("\n")
+
+    csv_path = path.with_suffix(".csv")
+    dbg.to_csv(csv_path, index=False)
+
+    print(f"Wrote diagnostics to {path}")
+    print(f"Wrote ranked diagnostics CSV to {csv_path}")
+    print("\nTop 20 model diagnostics:")
+    print(dbg[available_component_cols].head(20).to_string(index=False))
+
 
 # -----------------------------
 # Main
@@ -897,6 +1106,7 @@ def main():
 
     features_df = pd.DataFrame(rows).sort_values("id").reset_index(drop=True)
     features_df["score"] = build_final_scores(features_df)
+    debug_diagnostics(features_df, out_path.with_name(out_path.stem + "_diagnostics.txt"))
 
     out_path = Path(args.output)
     submission = features_df[["id", "score"]]
