@@ -589,8 +589,9 @@ def mean_rank(df: pd.DataFrame, cols: List[str]) -> np.ndarray:
 
 
 def build_final_scores(df: pd.DataFrame) -> np.ndarray:
-    """Max-of-specialists ranking tuned for TPR@5%FPR."""
+    """Low-FPR specialist ranking tuned for TPR@5%FPR."""
     n = len(df)
+    zeros = pd.Series(np.zeros(n))
 
     weight_rank = mean_rank(df, [
         "w_cos_all", "w_cos_conv", "w_cos_bn", "w_cos_early", "w_cos_mid", "w_cos_late", "w_sign"
@@ -600,7 +601,6 @@ def build_final_scores(df: pd.DataFrame) -> np.ndarray:
     late_cka = mean_rank(df, ["cka_late", "cka_layer4", "cka_avgpool"])
     cka_rank = mean_rank(df, ["cka_mean", "cka_early", "cka_mid", "cka_late"])
 
-    # Clean agreement is deliberately weak. Same wrong and dark logits matter more.
     clean_dark = mean_rank(df, [
         "test_logit_cos", "test_neg_js", "test_top5_overlap", "main_neg_js", "nonmain_neg_js"
     ])
@@ -613,29 +613,126 @@ def build_final_scores(df: pd.DataFrame) -> np.ndarray:
         "highentropy_logit_cos", "highentropy_neg_js", "leakage_logit_cos", "leakage_neg_js"
     ])
     ood_rank = mean_rank(df, ["ood_logit_cos", "ood_neg_js", "ood_top5_overlap", "ood_conf_corr"])
-    transform_rank = mean_rank(df, ["transform_delta_cos", "transform_stability_agree", "mixmatch_cos", "mixmatch_neg_js", "mixmatch_top1"])
+    transform_rank = mean_rank(df, [
+        "transform_delta_cos", "transform_stability_agree",
+        "mixmatch_cos", "mixmatch_neg_js", "mixmatch_top1"
+    ])
     mem_rank = mean_rank(df, [
-        "mem_loss_gap_similarity", "mem_conf_gap_similarity", "mem_acc_gap_similarity", "mem_agree_gap_similarity"
+        "mem_loss_gap_similarity", "mem_conf_gap_similarity",
+        "mem_acc_gap_similarity", "mem_agree_gap_similarity"
     ])
     fgsm_rank = mean_rank(df, ["fgsm_logit_cos", "fgsm_top1_agree", "fgsm_neg_js"])
     jac_rank = mean_rank(df, ["jacobian_cos", "jacobian_sign"])
 
-    direct_score = 0.58 * weight_rank + 0.30 * bn_rank + 0.12 * cka_rank
-    finetune_score = 0.34 * early_mid_cka + 0.24 * bn_rank + 0.18 * transform_rank + 0.24 * mem_rank
-    distilled_score = 0.28 * clean_dark + 0.24 * leakage_rank + 0.20 * ood_rank + 0.18 * mistake_rank + 0.10 * late_cka
-    boundary_score = 0.35 * leakage_rank + 0.25 * fgsm_rank + 0.20 * jac_rank + 0.20 * mistake_rank
-    dataset_score = 0.55 * mem_rank + 0.25 * early_mid_cka + 0.20 * transform_rank
+    # More specialized, less averaged.
+    direct_score = (
+        0.50 * weight_rank
+      + 0.35 * bn_rank
+      + 0.15 * cka_rank
+    )
 
-    final = np.maximum.reduce([direct_score, finetune_score, distilled_score, boundary_score, dataset_score])
+    finetune_score = (
+        0.35 * early_mid_cka
+      + 0.25 * bn_rank
+      + 0.25 * mem_rank
+      + 0.15 * transform_rank
+    )
 
-    # High-confidence override for likely direct/fine-tuned descendants.
-    override = np.maximum.reduce([
-        0.70 * rank01(df.get("w_cos_all", pd.Series(np.zeros(n))).values) + 0.30 * rank01(df.get("w_cos_bn", pd.Series(np.zeros(n))).values),
-        0.55 * rank01(df.get("w_cos_early", pd.Series(np.zeros(n))).values) + 0.45 * rank01(df.get("cka_early", pd.Series(np.zeros(n))).values),
+    distilled_score = (
+        0.28 * leakage_rank
+      + 0.22 * ood_rank
+      + 0.22 * mistake_rank
+      + 0.18 * clean_dark
+      + 0.10 * late_cka
+    )
+
+    boundary_score = (
+        0.35 * leakage_rank
+      + 0.25 * fgsm_rank
+      + 0.20 * jac_rank
+      + 0.20 * mistake_rank
+    )
+
+    dataset_score = (
+        0.60 * mem_rank
+      + 0.25 * early_mid_cka
+      + 0.15 * transform_rank
+    )
+
+    # Conservative consensus terms. Helps low-FPR ranking.
+    copy_consensus = np.sqrt(np.maximum(direct_score, 1e-9) * np.maximum(finetune_score, 1e-9))
+    behavior_consensus = np.sqrt(np.maximum(distilled_score, 1e-9) * np.maximum(boundary_score, 1e-9))
+    dataset_consensus = np.sqrt(np.maximum(dataset_score, 1e-9) * np.maximum(early_mid_cka, 1e-9))
+
+    final = np.maximum.reduce([
+        direct_score,
+        finetune_score,
+        0.90 * distilled_score + 0.10 * behavior_consensus,
+        0.90 * boundary_score + 0.10 * behavior_consensus,
+        0.90 * dataset_score + 0.10 * dataset_consensus,
+        0.70 * copy_consensus + 0.30 * direct_score,
     ])
-    final = np.maximum(final, 0.97 * override)
 
-    # Return percentile ranks, not raw values. This is better for TPR@low-FPR.
+    # Hard override only for genuinely obvious descendants.
+    w_all = df.get("w_cos_all", zeros).values
+    w_bn = df.get("w_cos_bn", zeros).values
+    w_early = df.get("w_cos_early", zeros).values
+    w_late = df.get("w_cos_late", zeros).values
+    cka_mean_raw = df.get("cka_mean", zeros).values
+    transform_raw = df.get("transform_delta_cos", zeros).values
+
+    obvious_direct = (
+        (w_all > 0.985) |
+        ((w_bn > 0.985) & (cka_mean_raw > 0.90)) |
+        ((w_early > 0.975) & (w_late > 0.925))
+    )
+
+    obvious_finetune = (
+        (w_early > 0.945) &
+        (cka_mean_raw > 0.86) &
+        (transform_raw > 0.65)
+    )
+
+    final[obvious_direct] = np.maximum(final[obvious_direct], 0.995)
+    final[obvious_finetune] = np.maximum(final[obvious_finetune], 0.970)
+
+    # Penalize clean-agreement-only models:
+    # likely independent same-distribution models.
+    clean_top1 = rank01(df.get("test_top1_agree", zeros).values)
+    clean_top5 = rank01(df.get("test_top5_overlap", zeros).values)
+    clean_signal = 0.5 * clean_top1 + 0.5 * clean_top5
+
+    weak_lineage = 1.0 - np.maximum.reduce([
+        weight_rank,
+        bn_rank,
+        cka_rank,
+        mistake_rank,
+        mem_rank,
+    ])
+
+    clean_only_penalty = clean_signal * weak_lineage
+    final = final - 0.12 * clean_only_penalty
+
+    # Penalize OOD-only spikes unless supported by leakage/mistake/CKA.
+    ood_only_penalty = ood_rank * (1.0 - np.maximum.reduce([
+        leakage_rank,
+        mistake_rank,
+        late_cka,
+        cka_rank,
+    ]))
+    final = final - 0.06 * ood_only_penalty
+
+    # Small boost when multiple independent families agree.
+    multi_signal = np.mean(np.stack([
+        direct_score,
+        finetune_score,
+        distilled_score,
+        boundary_score,
+        dataset_score,
+    ], axis=0), axis=0)
+
+    final = 0.90 * final + 0.10 * multi_signal
+
     return rank01(final, higher_is_more_stolen=True)
 
 
