@@ -1106,9 +1106,9 @@ def main():
 
     features_df = pd.DataFrame(rows).sort_values("id").reset_index(drop=True)
     features_df["score"] = build_final_scores(features_df)
-    debug_diagnostics(features_df, out_path.with_name(out_path.stem + "_diagnostics.txt"))
 
     out_path = Path(args.output)
+    debug_diagnostics(features_df, out_path.with_name(out_path.stem + "_diagnostics.txt"))
     submission = features_df[["id", "score"]]
     submission.to_csv(out_path, index=False)
     debug_path = out_path.with_name(out_path.stem + "_features.csv")
