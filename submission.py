@@ -62,7 +62,7 @@ BASE_URL = "http://34.63.153.158"
 API_KEY = "ef283bd434803248eee23a3b016499ae"  # replace with your actual API key
 
 TASK_ID = "19-stolen-model-detection"
-FILE_PATH = "/home/atml_team052/TML-Task2-Stolen_Model_Detection/submission.csv"  # replace with your actual file path
+FILE_PATH = "/home/atml_team052/TML-Task2-Stolen_Model_Detection/submission_behavior_heavy.csv"  # replace with your actual file path
 
 SUBMIT = True  # Set to True to enable submission
 

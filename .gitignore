@@ -5,3 +5,4 @@ dataset
 runlogs
 *.csv
 *.sub
+__pycache__
